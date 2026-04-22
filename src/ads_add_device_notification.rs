@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use bytes::{Bytes, BytesMut};
 use log::info;
-use crate::{Client, AdsCommand, AdsError, AdsErrorCode, Notification, AdsNotificationAttrib, HEADER_SIZE, LEN_ADD_DEV_NOT, Result, misc::HandleData};
+use crate::{AdsCommand, AdsError, AdsErrorCode, AdsNotificationAttrib, Client, HEADER_SIZE, LEN_ADD_DEV_NOT, Notification, Result, misc::{HandleData, NotificationCallback}};
 
 impl Client {
 
@@ -26,7 +26,7 @@ impl Client {
         _add_not_req.freeze()
     }
 
-    fn post_add_dev_not(&self, add_dev_not_response : HandleData, handle: &mut u32, callback : Notification, user_data: Option<&Arc<Mutex<BytesMut>>>) -> Result<()>{
+    fn post_add_dev_not(&self, add_dev_not_response : HandleData, handle: &mut u32, callback : Notification) -> Result<()>{
 
         let payload = add_dev_not_response.payload
                         .ok_or_else(|| AdsError{n_error : AdsErrorCode::ADSERR_DEVICE_INVALIDDATA.into(), s_msg : String::from("Invalid data values.")})?;
@@ -40,7 +40,7 @@ impl Client {
         // Check if registration of device notification was successfull
         if *handle != 0 {
             // Register notification handle
-            self.register_not_handle(*handle, callback, user_data);
+            self.register_not_handle(*handle, callback);
         }
         Ok(())
     }
@@ -48,7 +48,7 @@ impl Client {
     /// 
     /// Checkout the extensive examples [notification](https://github.com/hANSIc99/ads_client/blob/main/examples/notification.rs) 
     /// and [notification_async](https://github.com/hANSIc99/ads_client/blob/main/examples/notification_async.rs).
-    pub async fn add_device_notification(&self, idx_grp: u32, idx_offs: u32, attributes : &AdsNotificationAttrib, handle: &mut u32, callback : Notification, user_data: Option<&Arc<Mutex<BytesMut>>> ) -> Result<()>{
+    pub async fn add_device_notification<Callback: NotificationCallback>(&self, idx_grp: u32, idx_offs: u32, attributes : &AdsNotificationAttrib, handle: &mut u32, callback : Callback ) -> Result<()>{
         // Prepare AddDeviceNotification request
         let invoke_id = self.create_invoke_id();
         let _add_not_req = self.pre_add_dev_not(idx_grp, idx_offs, attributes, invoke_id);
@@ -64,7 +64,7 @@ impl Client {
         let socket_future = self.socket_write(&_add_not_req);
 
         tokio::try_join!(cmd_man_future, socket_future).and_then( | (add_not_response, _) | {
-            self.post_add_dev_not(add_not_response, handle, callback, user_data)
+            self.post_add_dev_not(add_not_response, handle, Notification::new(callback))
         })
     }
 }

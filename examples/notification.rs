@@ -64,12 +64,27 @@ fn main() {
             cycle_time  : 0  // check for value change each cycle
         };
 
+        let notification_a = {
+            let user_data = buf_n_cnt_a.clone();
+
+            move |_handle: u32, _timestamp: u64, payload: Bytes| {
+                let n_cnt_a = u16::from_ne_bytes(payload[..].try_into().expect("Failed to parse data"));
+                println!("Notification Event!, n_cnt_a: {}", n_cnt_a);
+
+                { // LOCK
+                    let mut user_data = user_data.lock().expect("Threading error");
+                    user_data.clear();
+                    user_data.put(&payload[..]);
+                } // UNLOCK
+            }
+        };
+
         match rt.block_on(ads_client.add_device_notification(   0xF005,
                                                                 var_hdl_a,
                                                                 &ads_notification_attrib_a,
                                                                 &mut not_hdl_a,
                                                                 notification_a,
-                                                                Some(&buf_n_cnt_a)))
+                                                                ))
         {
             Ok(_)     => {
                 println!("Waiting for notifications on n_cnt_a!");
@@ -88,13 +103,28 @@ fn main() {
             max_delay   : 500, // sumup notifications each 500ms
             cycle_time  : 0 // check for value change each cycle
         };
+
+        let notification_b = {
+            let user_data = buf_n_cnt_b.clone();
+
+            move |_handle: u32, _timestamp: u64, payload: Bytes| {
+                let n_cnt_b = u16::from_ne_bytes(payload[..].try_into().expect("Failed to parse data"));
+                println!("Notification Event!, n_cnt_b: {}", n_cnt_b);
+
+                { // LOCK
+                    let mut user_data = user_data.lock().expect("Threading error");
+                    user_data.clear();
+                    user_data.put(&payload[..]);
+                } // UNLOCK
+            }
+        };
         
         match rt.block_on(ads_client.add_device_notification(   0xF005,
                                                                 var_hdl_b,
                                                                 &ads_notification_attrib_b,
                                                                 &mut not_hdl_b,
                                                                 notification_b,
-                                                                Some(&buf_n_cnt_b)))
+                                                                ))
         {
             Ok(_)     => {
                 println!("Waiting for notifications on n_cnt_b!");
@@ -111,13 +141,30 @@ fn main() {
             max_delay   : 100, // sumup notifications each 100ms
             cycle_time  : 0 // check for value change each cycle
         };
+    
+        let notification_c = {
+            let user_data = buf_n_cnt_c.clone();
+
+            move |_handle: u32, _timestamp: u64, payload: Bytes| {
+                let n_cnt_c = u16::from_ne_bytes(payload[..].try_into().expect("Failed to parse data"));
+                if n_cnt_c % 100 == 0 {
+                    println!("Notification Event!, n_cnt_c: {}", n_cnt_c);
+                }
+        
+                { // LOCK
+                    let mut user_data = user_data.lock().expect("Threading error");
+                    user_data.clear();
+                    user_data.put(&payload[..]);
+                } // UNLOCK
+            }
+        };
         
         match rt.block_on(ads_client.add_device_notification(   0xF005,
                                                                 var_hdl_c,
                                                                 &ads_notification_attrib_c,
                                                                 &mut not_hdl_c,
                                                                 notification_c,
-                                                                Some(&buf_n_cnt_c)))
+                                                                ))
         {
             Ok(_)     => {
                 println!("Waiting for notifications on n_cnt_c!");
@@ -176,56 +223,4 @@ fn main() {
         println!("Final value n_cnt_c: {}", n_cnt_c);
     }
 
-}
-
-
-fn notification_a(_handle: u32, _timestamp: u64, payload: Bytes, user_data: Option<Arc<Mutex<BytesMut>>>){
-    let n_cnt_a = u16::from_ne_bytes(payload[..].try_into().expect("Failed to parse data"));
-    println!("Notification Event!, n_cnt_a: {}", n_cnt_a);
-
-    // Process userdata if available
-    if user_data.is_some() {
-        let user_data = user_data.unwrap();
-
-        { // LOCK
-            let mut user_data = user_data.lock().expect("Threading error");
-            user_data.clear();
-            user_data.put(&payload[..]);
-        } // UNLOCK
-    }
-}
-
-fn notification_b(_handle: u32, _timestamp: u64, payload: Bytes, user_data: Option<Arc<Mutex<BytesMut>>>){
-    let n_cnt_b = u16::from_ne_bytes(payload[..].try_into().expect("failed to parse data"));
-    println!("Notification Event!, n_cnt_b: {}", n_cnt_b);
-
-    // Process userdata if available
-    if user_data.is_some() {
-        let user_data = user_data.unwrap();
-
-        { // LOCK
-            let mut user_data = user_data.lock().expect("Threading error");
-            user_data.clear();
-            user_data.put(&payload[..]);
-        } // UNLOCK
-    }
-}
-
-fn notification_c(_handle: u32, _timestamp: u64, payload: Bytes, user_data: Option<Arc<Mutex<BytesMut>>>){
-    let n_cnt_c = u16::from_ne_bytes(payload[..].try_into().expect("failed to parse data"));
-    if n_cnt_c % 100 == 0 {
-        println!("Notification Event!, n_cnt_c: {}", n_cnt_c);
-    }
-    
-
-    // Process userdata if available
-    if user_data.is_some() {
-        let user_data = user_data.unwrap();
-
-        { // LOCK
-            let mut user_data = user_data.lock().expect("Threading error");
-            user_data.clear();
-            user_data.put(&payload[..]);
-        } // UNLOCK
-    }
 }
