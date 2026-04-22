@@ -53,13 +53,35 @@ pub type AmsNetId = [u8; 6];
 pub type Result<T> = std::result::Result<T, AdsError>;
 
 /// Type definition for notification callback.
-/// 
+///
 /// Arguments:
 /// 1. Handle
 /// 2. Timestamp
 /// 3. Value of monitored variable
-/// 4. User data
-pub type Notification = fn(u32, u64, Bytes, Option<Arc<Mutex<BytesMut>>>) -> (); // handle, timestamp and user data
+pub trait NotificationCallback: Fn(u32, u64, Bytes) + Send + Sync + 'static {}
+
+impl<T> NotificationCallback for T where T: Fn(u32, u64, Bytes) + Send + Sync + 'static {}
+
+
+#[derive(Clone)]
+pub struct Notification(Arc<Box<dyn NotificationCallback>>);
+
+impl Notification {
+    pub fn new<Callback: NotificationCallback>(callback: Callback) -> Self {
+        Self(Arc::new(Box::new(callback)))
+    }
+
+    pub fn call(&self, handle: u32, timestamp: u64, payload: Bytes) {
+        let mut f = &self.0;
+        f(handle, timestamp, payload)
+    }
+}
+
+impl std::fmt::Debug for Notification {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<function>")
+    }
+}
 
 /// Error type of returned Result
 ///  
@@ -178,7 +200,6 @@ pub struct Handle {
 pub struct NotHandle {
     pub callback  : Notification,
     pub not_hdl   : u32,
-    pub user_data : Option<Arc<Mutex<BytesMut>>>,
 }
 /// Specifies the maximum waiting time for an ADS response.
 /// 

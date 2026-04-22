@@ -432,13 +432,12 @@ impl Client {
         }
     }
 
-    fn register_not_handle(&self, not_hdl: u32, callback: Notification, user_data: Option<&Arc<Mutex<BytesMut>>>) {
+    fn register_not_handle(&self, not_hdl: u32, callback: Notification) {
         let a_not_handles = Arc::clone(&self.not_handles);
 
         let not_hdl = NotHandle {
             callback  : callback,
             not_hdl   : not_hdl,
-            user_data : user_data.and_then(|arc_bytes| Some(Arc::clone(arc_bytes)) )
         };
 
         {
@@ -623,7 +622,7 @@ impl Client {
                     return;
                 }
 
-                let mut _cb_and_data : Option<(Notification, Option<Arc<Mutex<BytesMut>>>)> = None;
+                let mut _cb : Option<Notification> = None;
                 
                 // The callback must be called after the lock. 
                 // If it is called during the lock, it could block the access to the notification handles infinitely.
@@ -632,18 +631,18 @@ impl Client {
                     let mut _not_handles = not_register.lock().expect("Threading Error");
                     let mut _iter = _not_handles.iter_mut();
                     
-                    _cb_and_data = _iter.find( | hdl | hdl.not_hdl  == not_sample.not_hdl)
-                            .and_then(| hdl : &mut NotHandle | Some( (hdl.callback, hdl.user_data.clone()) ) ); // Return callback and user data
+                    _cb = _iter.find( | hdl | hdl.not_hdl  == not_sample.not_hdl)
+                            .and_then(| hdl : &mut NotHandle | Some( hdl.callback.clone() ) ); // Return callback and user data
                 } // UNLOCK
                 
                 
-                _cb_and_data.and_then(|(callback, user_data)| {
+                _cb.and_then(|callback| {
                     let payload = Bytes::from(data.slice(stamp_header_offset..stamp_header_offset + not_sample.sample_size as usize));
                     // let n_cnt = u16::from_ne_bytes(payload[..].try_into().expect("Failed to parse data")); // DEBUG
 
                     Some(
                             rt.spawn(async move  {
-                            callback(not_sample.not_hdl, stamp_header.timestamp, payload, user_data);
+                            callback.call(not_sample.not_hdl, stamp_header.timestamp, payload);
                         })
                     )
                     
