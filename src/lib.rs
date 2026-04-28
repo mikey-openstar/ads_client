@@ -40,10 +40,10 @@ mod ads_read_device_info;
 
 use std::time::{Instant, Duration};
 use std::io;
-use std::net::SocketAddr;
+use std::net::Ipv4Addr;
 use std::mem::size_of_val;
 use std::sync::{Arc, Mutex, atomic::{AtomicU16, Ordering}};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio::{runtime, stream};
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
@@ -54,9 +54,8 @@ use bytes::{Bytes, BytesMut};
 use command_cleaner::CommandCleaner;
 use command_manager::CommandManager;
 
-use misc::{AdsCommand, Handle, HandleData, NotHandle, AmsNetId, AdsStampHeader, AdsNotificationSample};
-pub use misc::{AdsTimeout, AdsNotificationAttrib, AdsTransMode, StateInfo, DeviceStateInfo, AdsState, Notification, Result, AdsError, AdsErrorCode}; // Re-export type
-
+use misc::{AdsCommand, Handle, HandleData, NotHandle, AdsStampHeader, AdsNotificationSample};
+pub use misc::{AdsTimeout, AmsNetId, AmsPort, AmsAddr, AdsNotificationAttrib, AdsTransMode, StateInfo, DeviceStateInfo, AdsState, Notification, Result, AdsError, AdsErrorCode}; // Re-export type
 
 /// Size of the AMS/TCP + ADS headers
 // https://infosys.beckhoff.com/content/1033/tc3_ads_intro/115845259.html?id=6032227753916597086
@@ -76,31 +75,65 @@ enum ProcessStateMachine{
     ReadPayload { len_payload: usize, err_code: u32, invoke_id: u32, cmd: AdsCommand}
 }
 
-#[derive(Debug)]
-pub struct ClientBuilder<'a> {
-    addr: &'a str,
-    port: u16,
+#[derive(Debug, Clone)]
+pub struct ClientBuilder<RouterAddr> {
+    router_addr: RouterAddr,
+    dst_ams_addr: AmsAddr,
+    src_ams_addr: Option<AmsAddr>,
     timeout: AdsTimeout,
     retry_delay: Option<Duration>,
 }
 
-impl<'a> ClientBuilder<'a> {
-    pub fn new(addr: &'a str, port: u16) -> Self {
-        Self { addr, port, timeout: AdsTimeout::DefaultTimeout, retry_delay: None }
+impl ClientBuilder<()> {
+    pub fn new(dst_ams_addr: AmsAddr) -> ClientBuilder<(Ipv4Addr, u16)> {
+        ClientBuilder {
+            router_addr: (Ipv4Addr::new(127, 0, 0, 1), 48898),
+            dst_ams_addr,
+            src_ams_addr: Default::default(),
+            timeout: Default::default(),
+            retry_delay: Default::default(),
+        }
+    }
+}
+
+impl<RouterAddr> ClientBuilder<RouterAddr> {
+    pub fn router_addr<NextRouterAddr: ToSocketAddrs>(self, router_addr: NextRouterAddr) -> ClientBuilder<NextRouterAddr> {
+        ClientBuilder {
+            router_addr,
+            dst_ams_addr: self.dst_ams_addr,
+            src_ams_addr: self.src_ams_addr,
+            timeout: self.timeout,
+            retry_delay: self.retry_delay
+         }
+    }
+}
+
+impl<RouterAddr> ClientBuilder<RouterAddr> {
+    pub fn src_ams_addr(mut self, src_ams_addr: AmsAddr) -> Self {
+        self.src_ams_addr = Some(src_ams_addr);
+        self
     }
 
-    pub fn set_timeout(mut self, timeout: AdsTimeout) -> Self {
+    pub fn timeout(mut self, timeout: AdsTimeout) -> Self {
         self.timeout = timeout;
         self
     }
 
-    pub fn set_retry_delay(mut self, retry_delay: Option<Duration>) -> Self {
+    pub fn retry_delay(mut self, retry_delay: Option<Duration>) -> Self {
         self.retry_delay = retry_delay;
         self
     }
+}
 
+impl<RouterAddr: ToSocketAddrs> ClientBuilder<RouterAddr> {
     pub async fn build(self) -> Result<Client> {
-        Client::new(self.addr, self.port, self.timeout, self.retry_delay).await
+        Client::new(
+            self.router_addr,
+            self.dst_ams_addr,
+            self.src_ams_addr,
+            self.timeout,
+            self.retry_delay,
+        ).await
     }
 }
 
@@ -110,10 +143,8 @@ impl<'a> ClientBuilder<'a> {
 /// Use the [Client::new] method to create an instance.
 #[derive(Debug)]
 pub struct Client {
-    _dst_addr       : AmsNetId,
-    _dst_port       : u16,
-    _src_addr       : AmsNetId,
-    _src_port       : u16,
+    dst_ams_addr    : AmsAddr,
+    src_ams_addr    : AmsAddr,
     timeout         : u64, // ADS Timeout [s]
     socket_wrt      : Arc<Mutex<WriteHalf<TcpStream>>>,
     handles         : Arc<Mutex<Vec<Handle>>>, // Internal stack of Handles (^=ADS CommandsInvoke) for decoupling requests and responses
@@ -128,62 +159,42 @@ pub struct Client {
 
 impl Client {
    
-    async fn connect(answer: &mut [u8]) -> Result<TcpStream> {
-        let stream  = TcpStream::connect(&SocketAddr::from(([127, 0, 0, 1], 48898))).await.map_err::<AdsError, _>(|err| err.into() )?;
+    async fn connect(
+        router_addr: impl ToSocketAddrs,
+        dst_ams_addr: &AmsAddr,
+        src_ams_addr: &Option<AmsAddr>,
+    ) -> Result<(TcpStream, AmsAddr)> {
+        let mut stream  = TcpStream::connect(router_addr).await?;
+
+        // If we are given a source AMS address, we don't need to request one from the ADS router.
+        if let Some(src_ams_addr) = src_ams_addr {
+            return Ok((stream, src_ams_addr.clone()));
+        };
+
+        // Otherwise request a source AMS address from the ADS router...
+
         let handshake : [u8; 8] = [0x00, 0x10, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00 ];
+        let mut answer : [u8; 14] = [0; 14];
 
-        // WRITING
-        loop {
-            // Wait for the socket to be writable
-            stream.writable().await.map_err::<AdsError, _>(|err| err.into() )?;
-    
-            // Try to write data, this may still fail with `WouldBlock`
-            // if the readiness event is a false positive.
-            match stream.try_write(&handshake) {
-                Ok(_) => {
-                    break;
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    warn!("TcpStream: false positive reaction / stream was not yet ready for reading {:?}", e);
-                    continue;
-                }
-                Err(e) => {
-                    error!("Failed to write to socket");
-                    return Err(e.into());
-                }
+        if let Err(error) = stream.write_all(&handshake).await {
+            error!("Failed to write to socket");
+            return Err(error.into());
+        };
+
+        match stream.read_exact(&mut answer).await {
+            Ok(n) => {
+                info!("Connection to AMS router established");
+
+                let src_ams_net_id = AmsNetId([answer[6], answer[7], answer[8], answer[9], answer[10], answer[11]]);
+                let src_ams_port = u16::from_ne_bytes(answer[12..14].try_into().expect("Parsing source port failed"));
+
+                Ok((stream, (src_ams_net_id, src_ams_port)))
+            },
+            Err(_error) => {
+                error!("Router port disabled – TwinCAT system service not started.");
+                Err(AdsError{n_error : 18, s_msg : String::from("Port disabled – TwinCAT system service not started.")})
             }
         }
-
-        // READING
-        loop {
-            // Wait for the socket to be readable
-            stream.readable().await?;
-    
-            // Try to read data, this may still fail with `WouldBlock`
-            // if the readiness event is a false positive.
-            match stream.try_read(answer) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if n == 14 {
-                        info!("Connection to AMS router established");
-                        break;
-                    } else {
-                        error!("Router port disabled – TwinCAT system service not started.");
-                        return Err(AdsError{n_error : 18, s_msg : String::from("Port disabled – TwinCAT system service not started.")});
-                    }
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    warn!("TcpStream: false positive reaction / stream was not yet ready for writing {:?}", e);
-                    continue;
-                }
-                Err(_) => {
-                    error!("Router port disabled – TwinCAT system service not started.");
-                    return Err(AdsError{n_error : 18, s_msg : String::from("Port disabled – TwinCAT system service not started.")});
-                }
-            }
-        }
-
-        Ok(stream)
     } 
 
     async fn process_response(handles: Arc<Mutex<Vec<Handle>>>, not_handles: Arc<Mutex<Vec<NotHandle>>>, mut rd_stream : ReadHalf<TcpStream>, retry_delay: Option<Duration>) {
@@ -317,17 +328,15 @@ impl Client {
     ///     Ok(())
     /// }
     /// ```
-    async fn new(addr : &str, port : u16, timeout : AdsTimeout, retry_delay: Option<Duration>) -> Result<Self> {
+    async fn new(
+        router_addr: impl ToSocketAddrs,
+        dst_ams_addr: AmsAddr,
+        src_ams_addr: Option<AmsAddr>,
+        timeout: AdsTimeout,
+        retry_delay: Option<Duration>,
+    ) -> Result<Self> {
         let state_flag : u16 = 4;
         let error_code : u32 = 0;
-        let mut b_vec = Vec::<u8>::new();
-
-        // BAUSTELLE // Pass ADS Address
-        for s_byte in addr.split('.') {
-            // https://doc.rust-lang.org/rust-by-example/error/multiple_error_types/reenter_question_mark.html
-            let n_byte = s_byte.parse::<u8>()?;
-            b_vec.push(n_byte);
-        }
 
         let timeout = match timeout {
             AdsTimeout::DefaultTimeout => 5,
@@ -336,17 +345,19 @@ impl Client {
 
         let hdl_rt = runtime::Handle::current();
 
-        let mut answer : [u8; 14] = [0; 14];
+        let (stream, src_ams_addr) = Client::connect(router_addr, &dst_ams_addr, &src_ams_addr).await?;
 
-        let _stream = Client::connect(&mut answer).await?;
-        info!("ADS client port opened: {}", u16::from_ne_bytes(answer[12..14].try_into().unwrap_or_default()));
+        let (dst_ams_net_id, dst_ams_port) = &dst_ams_addr;
+        let (src_ams_net_id, src_ams_port) = &src_ams_addr;
+
+        info!("ADS client port opened: {}", src_ams_port);
 
         // Split the stream into a read and write part
         //
         // Read-half goes to process_response()
         // Write-half goes to Self
 
-        let (read, write) = tokio::io::split(_stream);
+        let (read, write) = tokio::io::split(stream);
 
         let a_socket_wrt = Arc::new(Mutex::new(write));
 
@@ -363,56 +374,56 @@ impl Client {
         let response_vector_b = Arc::clone(&a_handles);
         hdl_rt.spawn(CommandCleaner::new(1, timeout, response_vector_b));
 
+        let ams_header = [
+            0, // Reserved
+            0,
+            0, // Header size + playload
+            0,
+            0,
+            0,
+            dst_ams_net_id[0], // Target NetId
+            dst_ams_net_id[1],
+            dst_ams_net_id[2],
+            dst_ams_net_id[3],
+            dst_ams_net_id[4],
+            dst_ams_net_id[5],
+            u16_low_byte!(*dst_ams_port), // Target port
+            u16_high_byte!(*dst_ams_port), 
+            src_ams_net_id[0], //  Source NetId
+            src_ams_net_id[1],
+            src_ams_net_id[2],
+            src_ams_net_id[3],
+            src_ams_net_id[4],
+            src_ams_net_id[5],
+            u16_low_byte!(*src_ams_port), // Source Port
+            u16_high_byte!(*src_ams_port), 
+            0, // Command-Id
+            0, 
+            u16_low_byte!(state_flag), // State flags
+            u16_high_byte!(state_flag), 
+            0, // Length
+            0,
+            0,
+            0, 
+            u32_lw_lb!(error_code), // Error code
+            u32_lw_hb!(error_code),
+            u32_hw_lb!(error_code),
+            u32_hw_hb!(error_code), 
+            0, // Invoke Id
+            0,
+            0,
+            0
+        ];
+
         Ok(Self {
-            _dst_addr    : b_vec.clone().try_into().expect("AmsNetId consist of exact 6 bytes"), // https://stackoverflow.com/questions/25428920/how-to-get-a-slice-as-an-array-in-rust
-            _dst_port    : port,
-            _src_addr    : [answer[6], answer[7], answer[8], answer[9], answer[10], answer[11]],
-            _src_port    : u16::from_ne_bytes(answer[12..14].try_into().expect("Parsing source port failed")),
+            src_ams_addr,
+            dst_ams_addr,
             timeout      : timeout,
             socket_wrt   : a_socket_wrt,
             handles      : a_handles,
             not_handles  : a_not_handles,
-            ams_header      : [
-                0, // Reserved
-                0,
-                0, // Header size + playload
-                0,
-                0,
-                0,
-                b_vec[0], // Target NetId
-                b_vec[1],
-                b_vec[2],
-                b_vec[3],
-                b_vec[4],
-                b_vec[5],
-                u16_low_byte!(port), // Target port
-                u16_high_byte!(port), 
-                answer[6], //  Source NetId
-                answer[7],
-                answer[8],
-                answer[9],
-                answer[10],
-                answer[11],
-                answer[12], // Source Port
-                answer[13], 
-                0, // Command-Id
-                0, 
-                u16_low_byte!(state_flag), // State flags
-                u16_high_byte!(state_flag), 
-                0, // Length
-                0,
-                0,
-                0, 
-                u32_lw_lb!(error_code), // Error code
-                u32_lw_hb!(error_code),
-                u32_hw_lb!(error_code),
-                u32_hw_hb!(error_code), 
-                0, // Invoke Id
-                0,
-                0,
-                0
-            ],
-            hdl_cnt         : Arc::new(AtomicU16::new(1))
+            ams_header   : ams_header,
+            hdl_cnt      : Arc::new(AtomicU16::new(1))
         })
     }
 

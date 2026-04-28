@@ -1,3 +1,8 @@
+use std::convert::Infallible;
+use std::fmt::Display;
+use std::num::ParseIntError;
+use std::ops::Index;
+use std::str::FromStr;
 use std::{fmt, io, num, error, convert, array};
 use std::time::Instant;
 use std::sync::{Arc, Mutex};
@@ -49,7 +54,57 @@ mod misc {
     }
 }
 
-pub type AmsNetId = [u8; 6];
+#[derive(Debug, Clone)]
+pub struct AmsNetId(pub [u8; 6]);
+
+impl Index<usize> for AmsNetId {
+    type Output = <[u8] as Index<usize>>::Output;
+    fn index(&self, index: usize) -> &Self::Output {
+        self.0.index(index)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum AmsNetIdFromStrError {
+    ParseByte(ParseIntError),
+    Not6Bytes,
+}
+
+impl error::Error for AmsNetIdFromStrError {}
+
+impl Display for AmsNetIdFromStrError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AmsNetIdFromStrError::ParseByte(parse_int_error) => {
+                write!(f, "Failed to parse byte: {}", parse_int_error)
+            },
+            AmsNetIdFromStrError::Not6Bytes => {
+                write!(f, "AmsNetId consist of exact 6 bytes")
+            }
+        }
+    }
+}
+
+impl FromStr for AmsNetId {
+    type Err = AmsNetIdFromStrError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let mut bytes: [u8; 6] = [0; 6];
+        // BAUSTELLE // Pass ADS Address
+        for (index, item) in s.split('.').enumerate() {
+            if index > 6 {
+                return Err(AmsNetIdFromStrError::Not6Bytes);
+            }
+            let byte = item.parse::<u8>().map_err(AmsNetIdFromStrError::ParseByte)?;
+            bytes[index] = byte;
+        }
+        Ok(Self(bytes))
+    }
+}
+
+pub type AmsPort = u16;
+pub type AmsAddr = (AmsNetId, AmsPort);
+
 pub type Result<T> = std::result::Result<T, AdsError>;
 
 /// Type definition for notification callback.
@@ -103,6 +158,13 @@ impl From<num::ParseIntError> for AdsError{
     fn from(error: num::ParseIntError) -> Self {
         // 1 : Internal Error
         AdsError {n_error : 1, s_msg :  error.to_string() }
+    }
+}
+
+impl From<AmsNetIdFromStrError> for AdsError{
+    fn from(error: AmsNetIdFromStrError) -> Self {
+        // 1 : Internal Error
+        AdsError {n_error : 1, s_msg : error.to_string() }
     }
 }
 
@@ -184,8 +246,9 @@ pub struct NotHandle {
 /// 
 /// - [AdsTimeout::DefaultTimeout] Corresponds to 5 seconds.
 /// - [AdsTimeout::CustomTimeout] Value in seconds.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub enum AdsTimeout {
+    #[default]
     DefaultTimeout,
     CustomTimeout(u64)
 }
