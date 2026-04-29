@@ -29,9 +29,8 @@ impl Client {
 
         Client::eval_ams_error(w_response.ams_err)?;
 
-        w_response.payload
-                    .map(|p| Client::eval_return_code(p.as_ref()))
-                    .ok_or_else(|| AdsError{n_error : AdsErrorCode::ADSERR_DEVICE_INVALIDDATA.into(), s_msg : String::from("Invalid data values")})??;
+        Client::eval_return_code(w_response.payload.as_ref());
+
         Ok(())
     }
     /// Submit an asynchronous [ADS Write](https://infosys.beckhoff.com/content/1033/tc3_ads_intro/115877899.html) request.
@@ -78,14 +77,14 @@ impl Client {
         info!("Submit Write Request: Invoke ID: {}, Write length: {}", invoke_id, data.len());
 
         // Create handle
-        self.register_command_handle(invoke_id, AdsCommand::Write);
+        let cmd_read_handle = self.register_command_handle(invoke_id, AdsCommand::Write).await;
 
-        // Launch the CommandManager future
-        let cmd_man_future = self.create_cmd_man_future(invoke_id);
+        // Launch the command future
+        let cmd_future = cmd_read_handle.read(self.timeout);
     
         // Launch socket future
         let socket_future = self.socket_write(&_w_request);
 
-        tokio::try_join!(cmd_man_future, socket_future).and_then(| (w_response, _) | Client::post_write(w_response))
+        tokio::try_join!(cmd_future, socket_future).and_then(| (w_response, _) | Client::post_write(w_response))
     }
 }

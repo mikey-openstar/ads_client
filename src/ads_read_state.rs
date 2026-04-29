@@ -5,9 +5,8 @@ impl Client {
 
     fn post_read_state(rs_response : HandleData) -> Result<StateInfo> {
 
-        let payload = rs_response.payload
-                    .ok_or_else(|| AdsError{n_error : AdsErrorCode::ADSERR_DEVICE_INVALIDDATA.into(), s_msg : String::from("Invalid data values.")})?;
-        
+        let payload = rs_response.payload;
+
         Client::eval_ams_error(rs_response.ams_err)?;
 
          if payload.len() != 8 {
@@ -60,14 +59,14 @@ impl Client {
         info!("Submit Read State Request: Invoke ID: {}", invoke_id);
 
         // Create handle
-        self.register_command_handle(invoke_id, AdsCommand::ReadState);
+        let cmd_read_handler = self.register_command_handle(invoke_id, AdsCommand::ReadState).await;
 
-        // Launch the CommandManager future
-        let cmd_man_future = self.create_cmd_man_future(invoke_id);
+        // Launch the command future
+        let cmd_future = cmd_read_handler.read(self.timeout);
 
         // Launch socket future
         let socket_future = self.socket_write(&ams_header);
 
-        tokio::try_join!(cmd_man_future, socket_future).and_then( | (rs_response, _) | Client::post_read_state(rs_response))
+        tokio::try_join!(cmd_future, socket_future).and_then( | (rs_response, _) | Client::post_read_state(rs_response))
     }
 }
