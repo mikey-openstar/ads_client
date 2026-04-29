@@ -26,9 +26,7 @@ impl Client {
     fn post_delete_device_notification(del_not_response : HandleData) -> Result<()>{
         Client::eval_ams_error(del_not_response.ams_err)?;
 
-        del_not_response.payload
-            .map(|p| Client::eval_return_code(p.as_ref()))
-            .ok_or_else(|| AdsError{n_error : AdsErrorCode::ADSERR_DEVICE_INVALIDDATA.into(), s_msg : String::from("Invalid data values")})??;
+        Client::eval_return_code(del_not_response.payload.as_ref());
 
         Ok(())
     }
@@ -45,15 +43,15 @@ impl Client {
         info!("Submit Delete Notification Request: Invoke ID: {}", invoke_id);
 
         // Create handle for request
-        self.register_command_handle(invoke_id, AdsCommand::DeleteDeviceNotification);
+        let cmd_read_handle = self.register_command_handle(invoke_id, AdsCommand::DeleteDeviceNotification).await;
 
-        // Launch the CommandManager future
-        let cmd_man_future = self.create_cmd_man_future(invoke_id);
+        // Launch the command future
+        let cmd_future = cmd_read_handle.read(self.timeout);
 
         // Launch socket future
         let socket_future = self.socket_write(&_del_not_req);
 
-        tokio::try_join!(cmd_man_future, socket_future).and_then(| (del_not_response, _)| {
+        tokio::try_join!(cmd_future, socket_future).and_then(| (del_not_response, _)| {
             Client::post_delete_device_notification(del_not_response)
         }) 
     }

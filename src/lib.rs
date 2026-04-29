@@ -27,8 +27,6 @@
 
 #[macro_use]
 mod misc;
-mod command_manager;
-mod command_cleaner;
 mod ads_read;
 mod ads_write;
 mod ads_read_state;
@@ -42,8 +40,9 @@ use std::time::{Instant, Duration};
 use std::io;
 use std::net::Ipv4Addr;
 use std::mem::size_of_val;
-use std::sync::{Arc, Mutex, atomic::{AtomicU16, Ordering}};
+use std::sync::{Arc, atomic::{AtomicU16, Ordering}};
 use tokio::net::{TcpStream, ToSocketAddrs};
+use tokio::sync::{Mutex, oneshot};
 use tokio::{runtime, stream};
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
@@ -51,10 +50,8 @@ use tokio::time::sleep;
 use log::{trace, debug, info, warn, error};
 use bytes::{Bytes, BytesMut};
 
-use command_cleaner::CommandCleaner;
-use command_manager::CommandManager;
 
-use misc::{AdsCommand, Handle, HandleData, NotHandle, AdsStampHeader, AdsNotificationSample};
+use misc::{AdsCommand, CommandReadHandle, CommandWriteHandle, HandleData, NotHandle, AdsStampHeader, AdsNotificationSample};
 pub use misc::{AdsTimeout, AmsNetId, AmsPort, AmsAddr, AdsNotificationAttrib, AdsTransMode, StateInfo, DeviceStateInfo, AdsState, Notification, Result, AdsError, AdsErrorCode}; // Re-export type
 
 /// Size of the AMS/TCP + ADS headers
@@ -147,7 +144,7 @@ pub struct Client {
     src_ams_addr    : AmsAddr,
     timeout         : u64, // ADS Timeout [s]
     socket_wrt      : Arc<Mutex<WriteHalf<TcpStream>>>,
-    handles         : Arc<Mutex<Vec<Handle>>>, // Internal stack of Handles (^=ADS CommandsInvoke) for decoupling requests and responses
+    cmd_handles     : Arc<Mutex<Vec<CommandWriteHandle>>>, // Internal stack of Handles (^=ADS CommandsInvoke) to write responses
     not_handles     : Arc<Mutex<Vec<NotHandle>>>,
     ams_header      : [u8; HEADER_SIZE],
     hdl_cnt         : Arc<AtomicU16>
@@ -197,7 +194,7 @@ impl Client {
         }
     } 
 
-    async fn process_response(handles: Arc<Mutex<Vec<Handle>>>, not_handles: Arc<Mutex<Vec<NotHandle>>>, mut rd_stream : ReadHalf<TcpStream>, retry_delay: Option<Duration>) {
+    async fn process_response(cmd_handles: Arc<Mutex<Vec<CommandWriteHandle>>>, not_handles: Arc<Mutex<Vec<NotHandle>>>, mut rd_stream : ReadHalf<TcpStream>, retry_delay: Option<Duration>) {
         
         let mut state = ProcessStateMachine::ReadHeader;
         let rt = runtime::Handle::current();
@@ -269,7 +266,7 @@ impl Client {
                                 },
                                 _ => {
                                     trace!("[1] Processing ADS response");
-                                    let _handles = Arc::clone(&handles);
+                                    let _handles = Arc::clone(&cmd_handles);
                                     rt.spawn(Client::process_command(*err_code, *invoke_id, _handles, buf));
                                 }
 
@@ -295,22 +292,13 @@ impl Client {
     } // fn
 
     async fn socket_write(&self, data: &[u8] ) -> Result<()> {
-
-                let a_wrt_stream = Arc::clone(&self.socket_wrt);
-                {
-                    let mut wrt_stream = a_wrt_stream.lock();
-
-                    match wrt_stream {
-                        Ok(ref mut stream) => {
-                            stream.write_all(data).await?;
-                        },
-                        Err(_) => {
-                            return Err( AdsError { n_error : 10, s_msg : String::from("Writing to Tcp Stream socket failed") } );
-                        }
-                    }
-                }
-                //Err(Box::new(AdsError{ n_error : 1792 })) // DEBUG
-                Ok(())          
+        let mut stream = self.socket_wrt.lock().await;
+        
+        if let Err(_) = stream.write_all(data).await {
+            Err( AdsError { n_error : 10, s_msg : String::from("Writing to Tcp Stream socket failed") } )
+        } else {
+            Ok(())
+        }
     }
     
     /// Create a new instance of an ADS client.
@@ -362,17 +350,13 @@ impl Client {
         let a_socket_wrt = Arc::new(Mutex::new(write));
 
         // Create atomic instances of the handle vector
-        let a_handles = Arc::new(Mutex::new( Vec::<Handle>::new() ));
+        let a_cmd_handles = Arc::new(Mutex::new( Vec::<CommandWriteHandle>::new() ));
         let a_not_handles =  Arc::new(Mutex::new( Vec::<NotHandle>::new() ));
 
         // Process incoming ADS responses
-        let response_vector_a  = Arc::clone(&a_handles);
+        let response_vector_a  = Arc::clone(&a_cmd_handles);
         let not_response_vector_a = Arc::clone(&a_not_handles);
         hdl_rt.spawn(Client::process_response(response_vector_a, not_response_vector_a, read, retry_delay));
-
-        // Instantiate and spawn the CommandCleanter
-        let response_vector_b = Arc::clone(&a_handles);
-        hdl_rt.spawn(CommandCleaner::new(1, timeout, response_vector_b));
 
         let ams_header = [
             0, // Reserved
@@ -420,46 +404,45 @@ impl Client {
             dst_ams_addr,
             timeout      : timeout,
             socket_wrt   : a_socket_wrt,
-            handles      : a_handles,
+            cmd_handles  : a_cmd_handles,
             not_handles  : a_not_handles,
             ams_header   : ams_header,
             hdl_cnt      : Arc::new(AtomicU16::new(1))
         })
     }
 
-    fn register_command_handle(&self, invoke_id : u32, cmd : AdsCommand){
-        let a_handles = Arc::clone(&self.handles);
-
-        let rs_req_hdl = Handle {
-            cmd_type  : cmd,
-            invoke_id : invoke_id,
-            data      : HandleData::default(),
-            timestamp : Instant::now(),
+    async fn register_command_handle(&self, invoke_id : u32, cmd : AdsCommand) -> CommandReadHandle {
+        let (sender, receiver) = oneshot::channel();
+        
+        let cmd_write_handle = CommandWriteHandle {
+            cmd_type    : cmd,
+            invoke_id   : invoke_id,
+            data_sender : sender,
+        };
+        let cmd_read_handle = CommandReadHandle {
+            cmd_type        : cmd,
+            invoke_id       : invoke_id,
+            data_receiver   : receiver,
         };
     
         {
-            let mut handles = a_handles.lock().expect("Threading Error");
-            handles.push(rs_req_hdl);
+            let mut cmd_handles = self.cmd_handles.lock().await;
+            cmd_handles.push(cmd_write_handle);
         }
+
+        cmd_read_handle
     }
 
-    fn register_not_handle(&self, not_hdl: u32, callback: Notification) {
-        let a_not_handles = Arc::clone(&self.not_handles);
-
+    async fn register_not_handle(&self, not_hdl: u32, callback: Notification) {
         let not_hdl = NotHandle {
             callback  : callback,
             not_hdl   : not_hdl,
         };
 
         {
-            let mut not_handles = a_not_handles.lock().expect("Threading Error");
+            let mut not_handles = self.not_handles.lock().await;
             not_handles.push(not_hdl);
         }
-    }
-
-    fn create_cmd_man_future(&self, invoke_id: u32) -> CommandManager {
-        let a_handles = Arc::clone(&self.handles);
-        CommandManager::new(self.timeout, invoke_id, a_handles)
     }
 
     fn create_invoke_id(&self) -> u32 {
@@ -529,25 +512,16 @@ impl Client {
         Ok(u32::from_ne_bytes(answer[4..8].try_into()?))
     }
 
-    async fn process_command(err_code: u32, invoke_id: u32, cmd_register: Arc<Mutex<Vec<Handle>>>, data: Bytes){
+    async fn process_command(err_code: u32, invoke_id: u32, cmd_register: Arc<Mutex<Vec<CommandWriteHandle>>>, data: Bytes){
         trace!("[2] AdsCmd: Invoke ID: {}", invoke_id);
 
-        match cmd_register.lock() {
-            Ok(mut h) => {
-
-                if let Some(hdl) =  h.iter_mut().find( | hdl | hdl.invoke_id == invoke_id) {
-                    hdl.data.payload = Some(data);
-                    hdl.data.ams_err = err_code;
-                } else {
-                    warn!("No corresponding invoke ID found in CMD register - response will expire");
-                }
-
-            },
-            Err(e) => {
-                error!("Failed to lock command register - response dropped");
-                return;
-            }
-        };
+        let mut h = cmd_register.lock().await;
+        if let Some(index) = h.iter().position(|hdl| hdl.invoke_id == invoke_id) {
+            let hdl = h.swap_remove(index);
+            hdl.write(HandleData { ams_err: err_code, payload: data });
+        } else {
+            warn!("No corresponding invoke ID found in CMD register - response will expire");
+        }
     }
 
     async fn process_device_notification(not_register: Arc<Mutex<Vec<NotHandle>>>, data: Bytes){
@@ -639,7 +613,7 @@ impl Client {
                 // If it is called during the lock, it could block the access to the notification handles infinitely.
 
                 { // LOCK
-                    let mut _not_handles = not_register.lock().expect("Threading Error");
+                    let mut _not_handles = not_register.lock().await;
                     let mut _iter = _not_handles.iter_mut();
                     
                     _cb = _iter.find( | hdl | hdl.not_hdl  == not_sample.not_hdl)

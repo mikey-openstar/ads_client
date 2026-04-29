@@ -1,7 +1,9 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 use log::info;
-use crate::{AdsCommand, AdsError, AdsErrorCode, AdsNotificationAttrib, Client, HEADER_SIZE, LEN_ADD_DEV_NOT, Notification, Result, misc::{HandleData, NotificationCallback}};
+use tokio::sync::Mutex;
+
+use crate::{Client, AdsCommand, AdsError, AdsErrorCode, Notification, AdsNotificationAttrib, HEADER_SIZE, LEN_ADD_DEV_NOT, Result, misc::{HandleData, NotificationCallback}};
 
 impl Client {
 
@@ -28,8 +30,7 @@ impl Client {
 
     fn post_add_dev_not(&self, add_dev_not_response : HandleData, handle: &mut u32, callback : Notification) -> Result<()>{
 
-        let payload = add_dev_not_response.payload
-                        .ok_or_else(|| AdsError{n_error : AdsErrorCode::ADSERR_DEVICE_INVALIDDATA.into(), s_msg : String::from("Invalid data values.")})?;
+        let payload = add_dev_not_response.payload;
 
         Client::eval_ams_error(add_dev_not_response.ams_err)?;
         Client::eval_return_code(payload.as_ref())?;
@@ -55,15 +56,15 @@ impl Client {
 
         info!("Submit Add Notification Request: Invoke ID: {}", invoke_id);
         // Create handle for request
-        self.register_command_handle(invoke_id, AdsCommand::AddDeviceNotification);
+        let cmd_read_handle = self.register_command_handle(invoke_id, AdsCommand::AddDeviceNotification).await;
 
-        // Launch CommandManager future
-        let cmd_man_future = self.create_cmd_man_future(invoke_id);
-        
+        // Launch command future
+        let cmd_future = cmd_read_handle.read(self.timeout);
+
         // Launch socket future
         let socket_future = self.socket_write(&_add_not_req);
 
-        tokio::try_join!(cmd_man_future, socket_future).and_then( | (add_not_response, _) | {
+        tokio::try_join!(cmd_future, socket_future).and_then( | (add_not_response, _) | {
             self.post_add_dev_not(add_not_response, handle, Notification::new(callback))
         })
     }

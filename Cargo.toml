@@ -15,7 +15,7 @@ keywords = ["Beckhoff", "ADS", "automation", "device", "PLC"]
 
 
 [dependencies]
-tokio = { version =  "1.19.2", features = ["rt", "rt-multi-thread", "net", "io-util", "macros", "time"] }
+tokio = { version =  "1.19.2", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 bytes = "1.5"
 log = { version = "0.4", features = ["max_level_trace"]}
 num_enum = "0.7.2"

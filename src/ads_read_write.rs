@@ -29,8 +29,7 @@ impl Client{
 
     fn post_read_write(rw_response : HandleData, read_data: &mut [u8]) -> Result<u32> {
 
-        let payload = rw_response.payload
-                            .ok_or_else(|| AdsError{n_error : AdsErrorCode::ADSERR_DEVICE_INVALIDDATA.into(), s_msg : String::from("Invalid data values.")})?;
+        let payload = rw_response.payload;
 
         Client::eval_ams_error(rw_response.ams_err)?;
         Client::eval_return_code(payload.as_ref())?;
@@ -83,14 +82,14 @@ impl Client{
         info!("Submit RW Request: Invoke ID: {}, Read length: {}, Write length: {}", invoke_id, read_data.len(), write_data.len());
 
         // Create handle
-        self.register_command_handle(invoke_id, AdsCommand::ReadWrite);
+        let cmd_read_handle = self.register_command_handle(invoke_id, AdsCommand::ReadWrite).await;
 
-        // Launch CommandManager future
-        let cmd_man_future = self.create_cmd_man_future(invoke_id);
+        // Launch command future
+        let cmd_future = cmd_read_handle.read(self.timeout);
     
         // Launch socket future
         let socket_future = self.socket_write(&_rw_request);
         
-        tokio::try_join!(cmd_man_future, socket_future).and_then(| (rw_response, _) | Client::post_read_write(rw_response, read_data))
+        tokio::try_join!(cmd_future, socket_future).and_then(| (rw_response, _) | Client::post_read_write(rw_response, read_data))
     }
 }

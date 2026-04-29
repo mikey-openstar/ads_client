@@ -34,9 +34,7 @@ impl Client {
     fn post_write_ctrl(wr_ctrl_response : HandleData) -> Result<()>{
         Client::eval_ams_error(wr_ctrl_response.ams_err)?;       
 
-        wr_ctrl_response.payload
-            .map(|p| Client::eval_return_code(p.as_ref()))
-            .ok_or_else(|| AdsError{n_error : AdsErrorCode::ADSERR_DEVICE_INVALIDDATA.into(), s_msg : String::from("Invalid data values")})??;
+        Client::eval_return_code(wr_ctrl_response.payload.as_ref());
 
         Ok(())
     }
@@ -49,14 +47,14 @@ impl Client {
         info!("Submit Write Control Request: Invoke ID: {}", invoke_id);
 
         // Create handle
-        self.register_command_handle(invoke_id, AdsCommand::WriteControl);
+        let cmd_read_handler = self.register_command_handle(invoke_id, AdsCommand::WriteControl).await;
 
-        // Launch the CommandManager future
-        let cmd_man_future = self.create_cmd_man_future(invoke_id);
+        // Launch the command future
+        let cmd_future = cmd_read_handler.read(self.timeout);
 
         // Launch socket future
         let socket_future = self.socket_write(&_wr_ctr_request);
 
-        tokio::try_join!(cmd_man_future, socket_future).and_then( | (wr_ctr_response, _) | Client::post_write_ctrl(wr_ctr_response))
+        tokio::try_join!(cmd_future, socket_future).and_then( | (wr_ctr_response, _) | Client::post_write_ctrl(wr_ctr_response))
     }
 }

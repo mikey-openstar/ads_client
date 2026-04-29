@@ -27,8 +27,7 @@ impl Client {
     fn post_read(read_response : HandleData, data: &mut [u8]) -> Result<u32> {
 
 
-        let payload = read_response.payload
-                            .ok_or_else(|| AdsError{n_error : AdsErrorCode::ADSERR_DEVICE_INVALIDDATA.into(), s_msg : String::from("Invalid data values.")})?;
+        let payload = read_response.payload;
 
         Client::eval_ams_error(read_response.ams_err)?;
         Client::eval_return_code(payload.as_ref())?;
@@ -100,10 +99,10 @@ impl Client {
         info!("Submit Read Request: Invoke ID: {}, Read length: {}", invoke_id, data.len());
 
         // Create handle
-        self.register_command_handle(invoke_id, AdsCommand::Read);
+        let cmd_read_handle = self.register_command_handle(invoke_id, AdsCommand::Read).await;
 
-        // Launch the CommandManager future
-        let cmd_man_future = self.create_cmd_man_future(invoke_id);
+        // Launch the command future
+        let cmd_future = cmd_read_handle.read(self.timeout);
 
         // Launch socket future
         let socket_future = self.socket_write(&_read_req);
@@ -111,6 +110,6 @@ impl Client {
         // https://docs.rs/tokio/latest/tokio/macro.try_join.html
         // INFO https://stackoverflow.com/questions/69031447/tokiotry-join-doesnt-return-the-err-variant-when-one-of-the-tasks-returns-er
 
-        tokio::try_join!(cmd_man_future, socket_future).and_then(| (rd_response, _) | Client::post_read(rd_response, data))
+        tokio::try_join!(cmd_future, socket_future).and_then(| (rd_response, _) | Client::post_read(rd_response, data))
     }
 }

@@ -4,10 +4,12 @@ use std::num::ParseIntError;
 use std::ops::Index;
 use std::str::FromStr;
 use std::{fmt, io, num, error, convert, array};
-use std::time::Instant;
-use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
+use tokio::sync::{Mutex, Notify, oneshot};
+use log::{error, trace, warn};
 
 #[macro_use]
 mod misc {
@@ -247,15 +249,55 @@ pub struct AdsNotificationSample {
 #[derive(Debug)]
 pub struct HandleData {
     pub ams_err : u32,
-    pub payload : Option<Bytes>
+    pub payload : Bytes
 }
 
 #[derive(Debug)]
-pub struct Handle {
-    pub cmd_type  : AdsCommand,
-    pub invoke_id : u32,
-    pub data      : HandleData,
-    pub timestamp : Instant, // Timestamp of creation
+pub struct CommandWriteHandle {
+    pub cmd_type    : AdsCommand,
+    pub invoke_id   : u32,
+    pub data_sender : oneshot::Sender<HandleData>
+}
+
+impl CommandWriteHandle {
+    pub fn write(self, data: HandleData) {
+        if let Err(_) = self.data_sender.send(data) {
+            error!("Unable to send command data - invoke ID: {}", self.invoke_id)
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct CommandReadHandle {
+    pub cmd_type        : AdsCommand,
+    pub invoke_id       : u32,
+    pub data_receiver   : oneshot::Receiver<HandleData>
+}
+
+pub const ADSERR_CLIENT_SYNCTIMEOUT : u32 = 0x745;
+
+impl CommandReadHandle {
+    pub async fn read(self, timeout_in_secs: u64) -> Result<HandleData> {
+        let start = Instant::now();
+        let timeout = Duration::from_secs(timeout_in_secs);
+       match tokio::time::timeout(timeout, self.data_receiver).await {
+            Ok(Ok(data)) => {
+                trace!("[3] Handle notified - processed after {:?} - AdsCmd: {:?} InvokeId: {}", (Instant::now() - start), self.cmd_type, self.invoke_id);
+                Ok(data)
+            },
+            Ok(Err(_recv_error)) => {
+                warn!("Command receiver dropped while sending - invoke ID: {}", self.invoke_id);
+
+                Err(AdsError{n_error : 1, s_msg : String::from("Command receiver dropped while sending")})
+            },
+            Err(elapsed) => {
+                warn!("Command expired (0x745) - invoke ID: {}", self.invoke_id);
+
+                Err(AdsError{n_error : ADSERR_CLIENT_SYNCTIMEOUT, s_msg : String::from("Timeout has occurred – the target is not responding in the specified ADS timeout.")})
+                
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
