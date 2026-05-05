@@ -198,7 +198,7 @@ impl Client {
 
                     let mut header_buf : [u8; HEADER_SIZE] = [0; HEADER_SIZE];
 
-                    match rd_stream.read(&mut header_buf).await {
+                    match rd_stream.read_exact(&mut header_buf).await {
                         Ok(0) => {
                            warn!("[0] Incoming ADS response - no bytes to read");
                         }
@@ -239,9 +239,9 @@ impl Client {
                 
                 ProcessStateMachine::ReadPayload {len_payload, err_code, invoke_id, cmd} => {
                     
-                    let mut payload = BytesMut::with_capacity(*len_payload);
+                    let mut payload = BytesMut::zeroed(*len_payload);
 
-                    match rd_stream.read_buf(&mut payload).await {
+                    match rd_stream.read_exact(&mut payload[..]).await {
                         Ok(0) => {
                             info!("[1] ADS response {:?}, Invoke ID: {:?}: - zero payload", cmd, invoke_id);
                             state = ProcessStateMachine::ReadHeader;
@@ -291,7 +291,7 @@ impl Client {
 
                     match wrt_stream {
                         Ok(ref mut stream) => {
-                            stream.write(data).await?;
+                            stream.write_all(data).await?;
                         },
                         Err(_) => {
                             return Err( AdsError { n_error : 10, s_msg : String::from("Writing to Tcp Stream socket failed") } );
