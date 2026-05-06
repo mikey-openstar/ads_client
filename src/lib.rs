@@ -208,7 +208,8 @@ impl Client {
 
                     match rd_stream.read_exact(&mut header_buf).await {
                         Ok(0) => {
-                           warn!("[0] Incoming ADS response - no bytes to read");
+                           warn!("[0] Readable stream closed");
+                           break;
                         }
                         Ok(_) => {
                             let len_payload = Client::extract_length(&header_buf).unwrap_or_default();
